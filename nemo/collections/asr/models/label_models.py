@@ -359,7 +359,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
         output = self.decoder(encoder_output=encoded, length=length)
         return output
 
-    def forward(self, input_signal, input_signal_length):
+    def forward(self, input_signal, input_signal_length, output_hidden_states=False):
         processed_signal, processed_signal_len = self.preprocessor(
             input_signal=input_signal,
             length=input_signal_length,
@@ -367,19 +367,20 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_len)
-
-        encoder_outputs = self.encoder(audio_signal=processed_signal, length=processed_signal_len)
-        if isinstance(encoder_outputs, tuple):
-            encoded, length = encoder_outputs
-        else:
-            encoded, length = encoder_outputs, None
+        
+        encoded, length, hidden = self.encoder(audio_signal=processed_signal, length=processed_signal_len, output_hidden_states=output_hidden_states)
+        #encoder_outputs = self.encoder(audio_signal=processed_signal, length=processed_signal_len)
+        #if isinstance(encoder_outputs, tuple):
+        #    encoded, length = encoder_outputs
+        #else:
+        #    encoded, length = encoder_outputs, None
         decoder_outputs = self.decoder(encoder_output=encoded, length=length)
         if isinstance(decoder_outputs, tuple):
             logits, embs = decoder_outputs
         else:
             logits, embs = decoder_outputs, None
 
-        return logits, embs
+        return logits, embs, hidden
 
     # PTL-specific methods
     def training_step(self, batch, batch_idx):
@@ -573,14 +574,16 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
         return self.multi_evaluation_epoch_end(outputs, dataloader_idx, 'test')
 
     @torch.no_grad()
-    def infer_file(self, path2audio_file):
+    def infer_file(self, path2audio_file, output_hidden_states=False):
         """
         Args:
             path2audio_file: path to an audio wav file
+            output_hidden_states: argument to allow returning hidden representations as well as speaker embedding
 
         Returns:
             emb: speaker embeddings (Audio representations)
             logits: logits corresponding of final layer
+            hidden: hidden representations
         """
         audio, sr = sf.read(path2audio_file)
         target_sr = self._cfg.train_ds.get('sample_rate', 16000)
@@ -596,13 +599,13 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
         mode = self.training
         self.freeze()
 
-        logits, emb = self.forward(input_signal=audio_signal, input_signal_length=audio_signal_len)
+        logits, emb, hidden = self.forward(input_signal=audio_signal, input_signal_length=audio_signal_len, output_hidden_states=output_hidden_states)
 
         self.train(mode=mode)
         if mode is True:
             self.unfreeze()
         del audio_signal, audio_signal_len
-        return emb, logits
+        return emb, logits, hidden
 
     @torch.no_grad()
     def infer_segment(self, segment):
@@ -679,23 +682,26 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
 
         return label
 
-    def get_embedding(self, path2audio_file):
+    def get_embedding(self, path2audio_file, output_hidden_states=False):
         """
         Returns the speaker embeddings for a provided audio file.
 
         Args:
             path2audio_file: path to an audio wav file
+            output_hidden_states: argument to allow returning hidden representations as well as speaker embedding
 
         Returns:
             emb: speaker embeddings (Audio representations)
+            hidden: hidden representations if output_hidden_states==True
         """
 
-        emb, _ = self.infer_file(path2audio_file=path2audio_file)
+        emb, _, hidden = self.infer_file(path2audio_file=path2audio_file, output_hidden_states=output_hidden_states)
 
-        return emb
+        if output_hidden_states: return emb, hidden
+        else: return emb
 
     @torch.no_grad()
-    def verify_speakers(self, path2audio_file1, path2audio_file2, threshold=0.7):
+    def verify_speakers(self, path2audio_file1, path2audio_file2, threshold=0.7, return_score=False):
         """
         Verify if two audio files are from the same speaker or not.
 
@@ -703,9 +709,11 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
             path2audio_file1: path to audio wav file of speaker 1
             path2audio_file2: path to audio wav file of speaker 2
             threshold: cosine similarity score used as a threshold to distinguish two embeddings (default = 0.7)
+            return_score: argument to allow returning the score instead of the thresholded decision
 
         Returns:
-            True if both audio files are from same speaker, False otherwise
+            True if both audio files are from same speaker, False otherwise; 
+            or, if return_score=True, the computed cosine similarity score
         """
         embs1 = self.get_embedding(path2audio_file1).squeeze()
         embs2 = self.get_embedding(path2audio_file2).squeeze()
@@ -716,13 +724,16 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin)
         similarity_score = torch.dot(X, Y) / ((torch.dot(X, X) * torch.dot(Y, Y)) ** 0.5)
         similarity_score = (similarity_score + 1) / 2
 
-        # Decision
-        if similarity_score >= threshold:
-            logging.info(" two audio files are from same speaker")
-            return True
+        if return_score:
+            return similarity_score
         else:
-            logging.info(" two audio files are from different speakers")
-            return False
+            # Decision
+            if similarity_score >= threshold:
+                logging.info(" two audio files are from same speaker")
+                return True
+            else:
+                logging.info(" two audio files are from different speakers")
+                return False
 
     @torch.no_grad()
     def verify_speakers_batch(self, audio_files_pairs, threshold=0.7, batch_size=32, sample_rate=16000, device='cuda'):
