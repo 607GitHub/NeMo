@@ -90,6 +90,7 @@ class ConvASREncoder(NeuralModule, Exportable, AccessMixin):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "length": NeuralType(tuple('B'), LengthsType()),
+                "output_hidden_representations": NeuralType(None, bool, True)
             }
         )
 
@@ -188,19 +189,26 @@ class ConvASREncoder(NeuralModule, Exportable, AccessMixin):
 
         self._feat_out = feat_in
 
+        self.encoder_layers = encoder_layers
         self.encoder = torch.nn.Sequential(*encoder_layers)
         self.apply(lambda x: init_weights(x, mode=init_mode))
 
         self.max_audio_length = 0
 
     @typecheck()
-    def forward(self, audio_signal, length):
+    def forward(self, audio_signal, length, output_hidden_states=False):
         self.update_max_sequence_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        s_input, length = self.encoder(([audio_signal], length))
-        if length is None:
-            return s_input[-1]
 
-        return s_input[-1], length
+        x = [audio_signal]
+        if output_hidden_states: hidden = []
+        for layer in self.encoder_layers:
+            x, length = layer((x, length))
+            if output_hidden_states: hidden.append(x)
+
+        if output_hidden_states == False:
+            hidden = None
+
+        return x[-1], length, hidden
 
     def update_max_sequence_length(self, seq_length: int, device):
         """
